@@ -23,18 +23,18 @@ typedef int capere_return_t;
 #define HOOK_SIZE BRANCH_ARM_SIZE
 
 typedef struct Capere {
-    instruction_t instructions[4];
-    instruction_t save_instructions[4];
+    instruction_t* instructions;
+    instruction_t* save_instructions;
     uint64_t address;
     uint64_t detour_address;
-    size_t size;
+    vm_size_t size;
     capere_return_t (*Hook)();
     capere_return_t (*HookRestore)();
     capere_return_t (*HookOriginal)();
     capere_return_t (*Patch)();
     capere_return_t (*Restore)();
     char* (*ErrorString)();
-} *Capere;
+} Capere;
 
 /*
 return an error string for a specific return value
@@ -74,17 +74,17 @@ uint64_t real_address(uint64_t address) {
 /*
 vm_write wrapper to write data to an address
 */
-capere_return_t write_region(uint64_t address, vm_size_t size, void *instructions) {
+capere_return_t write_region(Capere* capere) {
     kern_return_t kret;
     //prep for write instruction
-    kret = vm_protect(mach_task_self(), address, size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    kret = vm_protect(mach_task_self(), capere->address, capere->size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (kret != KERN_SUCCESS) {
         return PROTECT_HOOK_FAILURE;
     }
     //write instructions
-    kret = vm_write(mach_task_self(), address, (vm_offset_t) instructions, size);
+    kret = vm_write(mach_task_self(), capere->address, *(vm_offset_t*) &capere->instructions, capere->size);
     //set back original instructions
-    vm_protect(mach_task_self(), address, size, false, VM_PROT_READ | VM_PROT_EXECUTE);
+    vm_protect(mach_task_self(), capere->address, capere->size, false, VM_PROT_READ | VM_PROT_EXECUTE);
     if (kret != KERN_SUCCESS) {
         return WRITE_INSTRUCTION_FAILURE;
     }
@@ -94,9 +94,10 @@ capere_return_t write_region(uint64_t address, vm_size_t size, void *instruction
 /*
 vm_read_overwrite wrapper to save the instructions of a region
 */
-capere_return_t save_region(uint64_t address, vm_size_t size, void *save_instructions) {
+capere_return_t save_region(Capere* capere) {
     kern_return_t kret;
-    kret = vm_read_overwrite(mach_task_self(), address, size, (vm_offset_t) save_instructions, &size);
+
+    kret = vm_read_overwrite(mach_task_self(), capere->address, capere->size, (vm_offset_t) &capere->save_instructions, &capere->size);
     if (kret != KERN_SUCCESS) {
         return SAVE_INSTRUCTION_FAILURE;
     }
@@ -106,40 +107,30 @@ capere_return_t save_region(uint64_t address, vm_size_t size, void *save_instruc
 /*
 write_region and save_region wrapper to store the instructions at a specific address
 */
-capere_return_t capere_instruction_patch(uint64_t address, vm_size_t size, void *save_instructions, void *instructions) {
+capere_return_t capere_instruction_patch(Capere* capere) {
     capere_return_t cret;
-    cret = save_region(address, size, save_instructions);
+    cret = save_region(capere);
     if (cret != SAVE_INSTRUCTION_SUCCESS) {
         return SAVE_INSTRUCTION_FAILURE;
     }
-    cret = write_region(address, size, instructions);
+    cret = write_region(capere);
     if (cret != WRITE_INSTRUCTION_SUCCESS) {
         return WRITE_INSTRUCTION_FAILURE;
     }
     return HOOK_SUCCESS;
-}
-
-//abstraction for capere_instruction_patch
-capere_return_t capere_instruction_patch_abs(Capere capere) {
-    return capere_instruction_patch(capere->address, capere->size, capere->save_instructions, capere->instructions);
 }
 
 /*
 write region wrapper to restore an instruction patch
 ultimately this is just used for abstraction
 */
-capere_return_t capere_instruction_restore(uint64_t address, vm_size_t size, void *original_instructions) {
+capere_return_t capere_instruction_restore(Capere* capere) {
     capere_return_t cret;
-    cret = write_region(address, size, original_instructions);
+    cret = write_region(capere);
     if (cret != WRITE_INSTRUCTION_SUCCESS) {
         return WRITE_INSTRUCTION_FAILURE;
     }
     return HOOK_SUCCESS;
-}
-
-//abstraction for capere_instruction_restore
-capere_return_t capere_instruction_restore_abs(Capere capere) {
-    return capere_instruction_restore(capere->address, capere->size, capere->save_instructions);
 }
 
 
@@ -147,7 +138,7 @@ capere_return_t capere_instruction_restore_abs(Capere capere) {
 generate branch instruction
 see inside of function for documentation on how generating a branch instruction works
 */
-instruction_t* offset_to_branch_instruction(uint64_t address, uint64_t detour_address) {
+instruction_t* offset_to_branch_instruction(Capere* capere) {
     static instruction_t convert_array[4];
     uint32_t offset;
     int jump_byte = 0;
@@ -160,13 +151,13 @@ instruction_t* offset_to_branch_instruction(uint64_t address, uint64_t detour_ad
     08 00 00 14 will branch forward two instructions
     08 00 00 17 will branch back two instructions
     */
-    if (detour_address < address) {
-        offset = (address - detour_address) / 4;
+    if (capere->detour_address < capere->address) {
+        offset = (capere->address - capere->detour_address) / 4;
         offset = 0xF000000 - offset;
         jump_byte = 0x17;
     }
     else {
-        offset = (detour_address - address) / 4;
+        offset = (capere->detour_address - capere->address) / 4;
         jump_byte = 0x14;
     }
 
@@ -179,12 +170,12 @@ instruction_t* offset_to_branch_instruction(uint64_t address, uint64_t detour_ad
 /*
 generate a hook at a specific address
 */
-capere_return_t capere_hook(Capere capere) {
+capere_return_t capere_hook(Capere* capere) {
     capere_return_t cret;
-    instruction_t *instructions = offset_to_branch_instruction(capere->address, capere->detour_address);
-    vm_size_t size = BRANCH_ARM_SIZE;
+    instruction_t *instructions = offset_to_branch_instruction(capere);
+    capere->instructions = instructions;
 
-    cret = capere_instruction_patch(capere->address, size, capere->save_instructions, instructions);
+    cret = capere_instruction_patch(capere);
     if (cret != HOOK_SUCCESS) {
         return cret;
     }
@@ -194,11 +185,10 @@ capere_return_t capere_hook(Capere capere) {
 /*
 restore original instructions and remove hook
 */
-capere_return_t capere_hook_restore(Capere capere) {
+capere_return_t capere_hook_restore(Capere* capere) {
     capere_return_t cret;
-    vm_size_t size = BRANCH_ARM_SIZE;
 
-    cret = capere_instruction_restore(capere->address, size, capere->save_instructions);
+    cret = capere_instruction_restore(capere);
     if (cret != HOOK_SUCCESS) {
         return cret;
     }
@@ -208,12 +198,11 @@ capere_return_t capere_hook_restore(Capere capere) {
 /*
 capere_hook_original can be used for a 1 use "quick injection"
 */
-capere_return_t capere_hook_original(Capere capere) {
+capere_return_t capere_hook_original(Capere* capere) {
     capere_return_t cret;
-    vm_size_t size = BRANCH_ARM_SIZE;
 
     //place back original instructions
-    cret = capere_instruction_restore(capere->address, size, capere->save_instructions);
+    cret = capere_instruction_restore(capere);
     if (cret != HOOK_SUCCESS) {
         return cret;
     }
@@ -226,16 +215,16 @@ capere_return_t capere_hook_original(Capere capere) {
 }
 
 
-Capere CapereInit(uint64_t address_init, void* detour_function_init) {
-    Capere capere = malloc(sizeof(Capere));
+Capere* CapereInit(uint64_t address_init, void* detour_function_init) {
+    Capere *capere = malloc(sizeof(struct Capere));
     capere->address = real_address(address_init);
     capere->detour_address = (uint64_t) detour_function_init;
-    capere->size = 4;
+    capere->size = HOOK_SIZE;
     capere->Hook = &capere_hook;
     capere->HookRestore = &capere_hook_restore;
     capere->HookOriginal = &capere_hook_original;
-    capere->Patch = &capere_instruction_patch_abs;
-    capere->Restore = &capere_instruction_restore_abs;
+    capere->Patch = &capere_instruction_patch;
+    capere->Restore = &capere_instruction_restore;
     capere->ErrorString = &capere_error_string;
     return capere;
 }
